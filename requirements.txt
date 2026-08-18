@@ -1,0 +1,4 @@
+# Validator deps — CSV parsing + DIMER callback/S3 only. No ML.
+pandas==2.2.3
+requests==2.32.3
+boto3==1.35.76
