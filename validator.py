@@ -65,6 +65,13 @@ def _safe_float(value: str | None, default: float) -> float:
 
 MAX_TOTAL_UNCOMPRESSED_BYTES = _safe_int(os.getenv("DIMER_MAX_UNCOMPRESSED_BYTES"), 4 * 1024**3)
 MAX_COMPRESSION_RATIO = _safe_float(os.getenv("DIMER_MAX_COMPRESSION_RATIO"), 200.0)
+# Per-file uncompressed-byte ceiling and a full-read row ceiling. These bound memory BEFORE
+# pandas materializes a table, and — unlike the zip-bomb guard — also apply to directory-mode
+# inputs. An over-limit table is rejected, never silently truncated (truncation would corrupt
+# the validator's row/usable counts and the finetuner's class-preservation guarantees).
+MAX_MEMBER_UNCOMPRESSED_BYTES = _safe_int(os.getenv("DIMER_MAX_MEMBER_BYTES"), 1 * 1024**3)
+MAX_CSV_ROWS = _safe_int(os.getenv("DIMER_MAX_CSV_ROWS"), 5_000_000)
+CSV_READ_CHUNK_ROWS = _safe_int(os.getenv("DIMER_CSV_CHUNK_ROWS"), 200_000)
 _DATASET_DIR_ALIASES = {"dataset", "datasets"}
 
 
@@ -89,6 +96,11 @@ def _assert_zip_safe(zf: zipfile.ZipFile) -> None:
         if info.is_dir():
             continue
         total += info.file_size
+        if info.file_size > MAX_MEMBER_UNCOMPRESSED_BYTES:
+            raise ValueError(
+                f"archive member {info.filename!r} is {info.file_size:,} uncompressed bytes "
+                f"(> {MAX_MEMBER_UNCOMPRESSED_BYTES:,}); refusing (per-file guard)"
+            )
         if info.compress_size > 0:
             ratio = info.file_size / info.compress_size
             if ratio > MAX_COMPRESSION_RATIO:
@@ -169,9 +181,43 @@ class DatasetSource:
             return self._zip.open(raw)  # ZipExtFile — streams, no full-member read
         return open(raw, "rb")
 
+    def _member_bytes(self, normalized: str) -> int:
+        raw = self._members[normalized][0]
+        if self._zip is not None:
+            return self._zip.getinfo(raw).file_size
+        return os.path.getsize(raw)
+
+    def _guard_size(self, normalized: str) -> None:
+        """Reject an oversized member/file before pandas materializes it. Covers directory-mode
+        inputs too (the zip-bomb guard only sees archives)."""
+        size = self._member_bytes(normalized)
+        if size > MAX_MEMBER_UNCOMPRESSED_BYTES:
+            raise ValueError(
+                f"{normalized}: {size:,} uncompressed bytes exceeds the per-file limit "
+                f"{MAX_MEMBER_UNCOMPRESSED_BYTES:,} (DIMER_MAX_MEMBER_BYTES); refusing to load."
+            )
+
     def read_csv(self, normalized: str, nrows: int | None = None) -> pd.DataFrame:
+        """Read a CSV member with memory bounded before materialization: a raw-byte ceiling per
+        file, and — for a full read — a chunked parse that refuses to build a frame past
+        MAX_CSV_ROWS rather than OOM on a hostile or accidental giant table. Rows are never
+        silently dropped: an over-limit table is rejected, not truncated."""
+        self._guard_size(normalized)
+        if nrows is not None:
+            with self.open(normalized) as handle:
+                return pd.read_csv(handle, nrows=nrows)
         with self.open(normalized) as handle:
-            return pd.read_csv(handle, nrows=nrows)
+            chunks: list[pd.DataFrame] = []
+            rows = 0
+            for chunk in pd.read_csv(handle, chunksize=CSV_READ_CHUNK_ROWS):
+                rows += len(chunk)
+                if rows > MAX_CSV_ROWS:
+                    raise ValueError(
+                        f"{normalized}: exceeds the {MAX_CSV_ROWS:,}-row read ceiling "
+                        f"(DIMER_MAX_CSV_ROWS); refusing to load the whole table into memory."
+                    )
+                chunks.append(chunk)
+        return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
 
     def close(self) -> None:
         if self._zip is not None:

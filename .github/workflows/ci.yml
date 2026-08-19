@@ -15,5 +15,7 @@ jobs:
       - run: pip install pandas numpy requests pytest
       - name: Compile
         run: python -m py_compile validator.py
+      - name: Shared block (cross-repo parity)
+        run: python scripts/check_shared.py
       - name: Unit tests
         run: python -m pytest tests/ -q

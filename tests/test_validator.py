@@ -119,6 +119,37 @@ def test_val_with_no_usable_labels_fails(tmp_path):
     assert checks["val_has_usable_targets"] is False
 
 
+def test_member_byte_cap_zip(tmp_path, monkeypatch):
+    monkeypatch.setattr(V, "MAX_MEMBER_UNCOMPRESSED_BYTES", 100)  # smaller than the CSV
+    _zip(tmp_path, {"train.csv": _train(60, ("a", "b"))})
+    with pytest.raises(ValueError):
+        V.DatasetSource(tmp_path)
+
+
+def test_row_ceiling_rejected_not_truncated(tmp_path, monkeypatch):
+    monkeypatch.setattr(V, "MAX_CSV_ROWS", 10)
+    monkeypatch.setattr(V, "CSV_READ_CHUNK_ROWS", 4)
+    _zip(tmp_path, {"train.csv": _train(60, ("a", "b"))})  # 60 rows > ceiling of 10
+    src = V.DatasetSource(tmp_path)
+    try:
+        with pytest.raises(ValueError):
+            src.read_csv("train.csv")
+    finally:
+        src.close()
+
+
+def test_directory_mode_byte_cap(tmp_path, monkeypatch):
+    # A CSV dropped in a directory (no zip) must still be size-guarded before pandas reads it.
+    monkeypatch.setattr(V, "MAX_MEMBER_UNCOMPRESSED_BYTES", 50)
+    _train(60, ("a", "b")).to_csv(tmp_path / "train.csv", index=False)
+    src = V.DatasetSource(tmp_path)
+    try:
+        with pytest.raises(ValueError):
+            src.read_csv("train.csv")
+    finally:
+        src.close()
+
+
 def test_safe_parse_bad_env(monkeypatch):
     monkeypatch.setenv("DIMER_MAX_COMPRESSION_RATIO", "not-a-number")
     assert V._safe_float(os.environ.get("DIMER_MAX_COMPRESSION_RATIO"), 200.0) == 200.0
