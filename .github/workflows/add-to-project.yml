@@ -1,0 +1,25 @@
+# DIMER board auto-add — byte-identical across all 18 DIMER repos.
+# Drops new issues and PRs onto the "DIMER Workbench Pipeline" board (Projects v2 #2).
+#
+# Requires repo secret DIMER_PROJECT_TOKEN: a *classic* PAT with `repo` + `project`
+# scopes. The default GITHUB_TOKEN cannot write to a user-owned Projects v2 board,
+# which is why a PAT secret is needed. Set it across all repos with:
+#   .agent/scripts/dimer-set-project-secret.sh
+#
+# Status is set automatically by the board's built-in "item added -> Todo" workflow,
+# so this file only handles membership.
+name: Add to DIMER board
+on:
+  issues:
+    types: [opened, reopened, transferred]
+  pull_request:
+    types: [opened, reopened]
+permissions: {}
+jobs:
+  add-to-project:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/add-to-project@v1.0.2
+        with:
+          project-url: https://github.com/users/kurtvalcorza/projects/2
+          github-token: ${{ secrets.DIMER_PROJECT_TOKEN }}
