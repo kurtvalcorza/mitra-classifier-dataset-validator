@@ -49,8 +49,22 @@ MIN_ROWS_PER_CLASS = 2     # each class needs at least this many rows for a stra
 # Keep this block byte-identical across the validator and finetuner containers.
 # The CI parity check (scripts/check_shared.py) enforces it.
 # ============================================================================
-MAX_TOTAL_UNCOMPRESSED_BYTES = int(os.getenv("DIMER_MAX_UNCOMPRESSED_BYTES", str(4 * 1024**3)))
-MAX_COMPRESSION_RATIO = float(os.getenv("DIMER_MAX_COMPRESSION_RATIO", "200"))
+def _safe_int(value: str | None, default: int) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: str | None, default: float) -> float:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+MAX_TOTAL_UNCOMPRESSED_BYTES = _safe_int(os.getenv("DIMER_MAX_UNCOMPRESSED_BYTES"), 4 * 1024**3)
+MAX_COMPRESSION_RATIO = _safe_float(os.getenv("DIMER_MAX_COMPRESSION_RATIO"), 200.0)
 _DATASET_DIR_ALIASES = {"dataset", "datasets"}
 
 
@@ -308,6 +322,18 @@ def _build_checks(cfg: Config, source: DatasetSource) -> tuple[list[dict[str, An
     if not has_target:
         return checks, meta
 
+    target_dropped = cfg.target_column in cfg.drop_columns
+    checks.append({
+        "name": "target_not_dropped", "successful": not target_dropped,
+        "message": (
+            "Target column is not listed in drop_columns." if not target_dropped
+            else f"Target column '{cfg.target_column}' also appears in drop_columns; remove it "
+                 f"from drop_columns."
+        ),
+    })
+    if target_dropped:
+        return checks, meta
+
     # Usable rows = non-null target rows, the exact population the finetuner keeps.
     target = train[cfg.target_column]
     usable_target = target.dropna()
@@ -410,15 +436,28 @@ def _build_checks(cfg: Config, source: DatasetSource) -> tuple[list[dict[str, An
             ),
         })
         if same and cfg.target_column in other.columns:
-            other_classes = set(str(c) for c in other[cfg.target_column].dropna().unique())
-            unseen = sorted(other_classes - train_classes)
+            other_labels = other[cfg.target_column].dropna()
+            usable_other = int(len(other_labels))
             checks.append({
-                "name": f"{stem}_labels_subset_train", "successful": not unseen,
+                "name": f"{stem}_has_usable_targets", "successful": usable_other > 0,
+                "message": (
+                    f"{stem}.csv has {usable_other} non-null label rows."
+                    if usable_other > 0
+                    else f"{stem}.csv has no non-null labels; it would be scored on zero rows."
+                ),
+            })
+            other_classes = set(str(c) for c in other_labels.unique())
+            unseen = sorted(other_classes - train_classes)
+            # Only meaningful when the holdout actually has labels; an empty label set is caught
+            # by the usable-targets check above rather than passing vacuously here.
+            checks.append({
+                "name": f"{stem}_labels_subset_train",
+                "successful": bool(other_classes) and not unseen,
                 "message": (
                     f"{stem}.csv target labels are all present in train."
-                    if not unseen
-                    else f"{stem}.csv has labels not in train: {unseen[:10]}. The model cannot "
-                         f"predict a class it never trained on."
+                    if other_classes and not unseen
+                    else f"{stem}.csv has labels not in train: {unseen[:10]}." if unseen
+                    else f"{stem}.csv has no labels to check against train."
                 ),
             })
 

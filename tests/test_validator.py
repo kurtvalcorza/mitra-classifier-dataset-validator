@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import os
 import sys
 import zipfile
 from pathlib import Path
@@ -103,3 +104,21 @@ def test_zip_bomb_guard(tmp_path, monkeypatch):
     _zip(tmp_path, {"train.csv": big})
     with pytest.raises(ValueError):
         V.DatasetSource(tmp_path)  # highly compressible CSV -> ratio guard trips
+
+
+def test_target_in_drop_columns_fails(tmp_path):
+    checks, _ = _run(tmp_path, {"train.csv": _train(60, ("a", "b"))}, drop="target")
+    assert checks["target_not_dropped"] is False
+
+
+def test_val_with_no_usable_labels_fails(tmp_path):
+    train = _train(60, ("a", "b"))
+    val = _train(20, ("a", "b")).copy()
+    val["target"] = None  # all labels null
+    checks, _ = _run(tmp_path, {"train.csv": train, "val.csv": val})
+    assert checks["val_has_usable_targets"] is False
+
+
+def test_safe_parse_bad_env(monkeypatch):
+    monkeypatch.setenv("DIMER_MAX_COMPRESSION_RATIO", "not-a-number")
+    assert V._safe_float(os.environ.get("DIMER_MAX_COMPRESSION_RATIO"), 200.0) == 200.0
