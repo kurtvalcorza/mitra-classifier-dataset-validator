@@ -53,6 +53,32 @@ def test_happy_path(tmp_path):
     assert meta["classNames"] == ["a", "b", "c"]  # DIMER-mandatory metadata key
 
 
+def test_write_result_injects_class_names(tmp_path):
+    """Any payload routed through write_result (incl. the crash fallback) gets classNames."""
+    import json
+    out = tmp_path / "r.json"
+    cfg = V.Config(
+        dataset_dir=tmp_path, result_path=out, done_callback="", callback_timeout=1.0,
+        max_sample_files=25, pipeline_metadata={}, target_column="target", drop_columns=[],
+    )
+    V.write_result(cfg, {"successful": False, "message": "crash", "metadata": {"template": "x"}})
+    payload = json.loads(out.read_text())
+    assert payload["metadata"]["classNames"] == []
+
+
+def test_config_error_result_has_class_names(tmp_path, monkeypatch):
+    """The config-error fallback path (malformed env, no cfg) still emits classNames."""
+    import json
+    out = tmp_path / "result.json"
+    monkeypatch.setenv("DIMER_RESULT_PATH", str(out))
+    monkeypatch.setenv("DIMER_PREPROCESSING_ARGS_JSON", "{not valid json")
+    rc = V.main()
+    assert rc == 1
+    payload = json.loads(out.read_text())
+    assert payload["successful"] is False
+    assert payload["metadata"]["classNames"] == []
+
+
 def test_duplicate_train_rejected(tmp_path):
     # two members that both resolve to train.csv (one wrapped in dataset/)
     checks, _ = _run(tmp_path, {"train.csv": _train(), "dataset/train.csv": _train()})

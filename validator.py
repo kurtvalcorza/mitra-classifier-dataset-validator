@@ -261,7 +261,16 @@ def log(message: str) -> None:
     print(f"[{TEMPLATE_NAME}] {message}", flush=True)
 
 
+def _ensure_class_names(payload: dict[str, Any]) -> dict[str, Any]:
+    """DIMER requires metadata.classNames on every result payload — success, failure,
+    config-error, and crash fallbacks alike — defaulting to an empty array when unknown.
+    Single choke point so no write path can omit the mandatory key."""
+    payload.setdefault("metadata", {}).setdefault("classNames", [])
+    return payload
+
+
 def write_result(cfg: Config, payload: dict[str, Any]) -> None:
+    _ensure_class_names(payload)
     cfg.result_path.parent.mkdir(parents=True, exist_ok=True)
     content = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     cfg.result_path.write_text(content, encoding="utf-8")
@@ -562,12 +571,12 @@ def main() -> int:
         fallback = Path(os.getenv("DIMER_RESULT_PATH", "/data/dataset-validations/result.json"))
         try:
             fallback.parent.mkdir(parents=True, exist_ok=True)
-            fallback.write_text(json.dumps({
+            fallback.write_text(json.dumps(_ensure_class_names({
                 "successful": False,
                 "message": "Dataset validator configuration error.",
                 "error": {"type": type(exc).__name__, "message": str(exc)},
                 "metadata": {"template": TEMPLATE_NAME},
-            }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            }), indent=2, sort_keys=True) + "\n", encoding="utf-8")
         except Exception as write_exc:  # noqa: BLE001
             print(f"[{TEMPLATE_NAME}] failed to persist config error: {write_exc}", flush=True)
         return 1
