@@ -6,3 +6,10 @@ __pycache__/
 desktop.ini
 *.egg-info/
 out/
+# Local dataset / result artifacts (never committed).
+*.csv
+*.zip
+data/
+datasets/
+results/
+result.json
