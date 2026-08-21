@@ -50,6 +50,7 @@ def test_happy_path(tmp_path):
     checks, meta = _run(tmp_path, {"train.csv": _train(60, ("a", "b", "c"))})
     assert all(checks.values()), checks
     assert meta["classCount"] == 3
+    assert meta["classNames"] == ["a", "b", "c"]  # DIMER-mandatory metadata key
 
 
 def test_duplicate_train_rejected(tmp_path):

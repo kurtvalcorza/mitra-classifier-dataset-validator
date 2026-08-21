@@ -304,7 +304,9 @@ def notify_done_callback(cfg: Config) -> dict[str, Any]:
 
 def _build_checks(cfg: Config, source: DatasetSource) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     checks: list[dict[str, Any]] = []
-    meta: dict[str, Any] = {"targetColumn": cfg.target_column, "dropColumns": cfg.drop_columns}
+    # `classNames` is a DIMER-mandatory metadata key (empty default; set to the real
+    # labels once the target's classes are known). Present on every return path.
+    meta: dict[str, Any] = {"targetColumn": cfg.target_column, "dropColumns": cfg.drop_columns, "classNames": []}
 
     checks.append({
         "name": "no_nested_zip",
@@ -395,6 +397,7 @@ def _build_checks(cfg: Config, source: DatasetSource) -> tuple[list[dict[str, An
     n_classes = int(class_counts.size)
     meta["classCount"] = n_classes
     meta["classes"] = sorted(train_classes)[:MITRA_CLASS_LIMIT + 1]
+    meta["classNames"] = meta["classes"]  # DIMER-mandatory key, now the real labels
     in_range = 2 <= n_classes <= MITRA_CLASS_LIMIT
     checks.append({
         "name": "target_class_count", "successful": in_range,
