@@ -1,0 +1,26 @@
+# Keep the DIMER CodeBuild context minimal: only requirements.txt + the
+# validator sources are COPYed into the image. Everything below is local-only
+# (dev caches, tests, docs, and any dataset/result artifacts) and must never
+# enter the build context.
+.git
+.github
+.gitignore
+.dockerignore
+docs/
+scripts/
+tests/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+desktop.ini
+out/
+# Local dataset / result artifacts (never part of a build).
+*.csv
+*.zip
+data/
+datasets/
+results/
+result.json

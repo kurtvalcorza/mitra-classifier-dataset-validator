@@ -7,7 +7,9 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY validator.py ./
+# validator.py is the tested implementation; validate.py is the portal-named
+# entrypoint (DIMER's Pipeline Builder invokes `validate.py`) that delegates to it.
+COPY validator.py validate.py ./
 
 # DIMER launches this as a K8s Job with the env vars set.
-CMD ["python", "validator.py"]
+CMD ["python", "validate.py"]
