@@ -298,17 +298,33 @@ def _upload_result_to_s3(content: str) -> None:
         log(f"Failed to upload result to S3: {exc}")
 
 
-def notify_done_callback(cfg: Config) -> dict[str, Any]:
-    if not cfg.done_callback:
+def _post_done_callback(callback: str, timeout: float) -> dict[str, Any]:
+    """POST the DIMER done callback. Shared by the Config-based and env-based notifiers so the
+    normal path and the config-parse-failure path report completion identically."""
+    if not callback:
         return {"attempted": False, "message": "DIMER_DONE_CALLBACK not set; skipping."}
-    parsed = urlparse(cfg.done_callback)
+    parsed = urlparse(callback)
     if parsed.scheme not in {"http", "https"}:
         return {"attempted": False, "message": f"Unsupported scheme: {parsed.scheme}"}
     try:
-        response = requests.post(cfg.done_callback, timeout=cfg.callback_timeout)
+        response = requests.post(callback, timeout=timeout)
         return {"attempted": True, "ok": response.ok, "statusCode": response.status_code}
     except requests.RequestException as exc:
         return {"attempted": True, "ok": False, "error": str(exc)}
+
+
+def notify_done_callback(cfg: Config) -> dict[str, Any]:
+    return _post_done_callback(cfg.done_callback, cfg.callback_timeout)
+
+
+def _notify_from_env() -> dict[str, Any]:
+    """Best-effort done callback when config parsing failed and no Config exists: read the URL
+    and timeout straight from the environment so the backend is still notified and the Workbench
+    UI never hangs at 'Validating...'."""
+    return _post_done_callback(
+        os.getenv("DIMER_DONE_CALLBACK", "").strip(),
+        _safe_float(os.getenv("DIMER_CALLBACK_TIMEOUT_SECONDS"), 10.0),
+    )
 
 
 def _build_checks(cfg: Config, source: DatasetSource) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -557,48 +573,61 @@ def run(cfg: Config) -> int:
             },
         }
         write_result(cfg, payload)
-        log(f"Callback: {json.dumps(notify_done_callback(cfg), sort_keys=True)}")
+        # The done callback fires exactly once, unconditionally, in main()'s finally — which
+        # also covers a write_result failure here and the config-parse-failure path. Calling it
+        # here too would double-notify on the success path.
         return 0 if successful else 1
     finally:
         source.close()
 
 
+def _persist_failure(cfg: Config | None, exc: Exception) -> None:
+    """Write a structured failure result.json. Uses the full write path (classNames + S3 upload)
+    when a Config exists; falls back to a direct env-addressed write when config parsing itself
+    failed. Best-effort — a persistence failure is logged, never raised, so the done callback in
+    main()'s finally still fires."""
+    payload: dict[str, Any] = {
+        "successful": False,
+        "message": ("Dataset validator configuration error." if cfg is None
+                    else "Dataset validator crashed."),
+        "error": {"type": type(exc).__name__, "message": str(exc)},
+        "metadata": {"template": TEMPLATE_NAME},
+    }
+    if cfg is not None:
+        payload["error"]["traceback"] = traceback.format_exc()
+        payload["metadata"]["datasetDir"] = str(cfg.dataset_dir)
+    try:
+        if cfg is not None:
+            write_result(cfg, payload)
+        else:
+            fallback = Path(os.getenv("DIMER_RESULT_PATH", "/data/dataset-validations/result.json"))
+            fallback.parent.mkdir(parents=True, exist_ok=True)
+            fallback.write_text(
+                json.dumps(_ensure_class_names(payload), indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+    except Exception as write_exc:  # noqa: BLE001
+        print(f"[{TEMPLATE_NAME}] failed to persist failure result: {write_exc}", flush=True)
+
+
 def main() -> int:
+    """Guarantee the DIMER done callback on EVERY exit path (pass, check-fail, config-parse
+    error, crash, and even a result-write failure) via a finally block, so the Workbench UI never
+    hangs at 'Validating...'. The callback is decoupled from a successful result write."""
+    cfg: Config | None = None
     try:
         cfg = load_config()
-    except Exception as exc:  # noqa: BLE001 - config parse failure, no cfg to persist with
-        print(f"[{TEMPLATE_NAME}] configuration error: {exc}", flush=True)
-        fallback = Path(os.getenv("DIMER_RESULT_PATH", "/data/dataset-validations/result.json"))
-        try:
-            fallback.parent.mkdir(parents=True, exist_ok=True)
-            fallback.write_text(json.dumps(_ensure_class_names({
-                "successful": False,
-                "message": "Dataset validator configuration error.",
-                "error": {"type": type(exc).__name__, "message": str(exc)},
-                "metadata": {"template": TEMPLATE_NAME},
-            }), indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        except Exception as write_exc:  # noqa: BLE001
-            print(f"[{TEMPLATE_NAME}] failed to persist config error: {write_exc}", flush=True)
-        return 1
-    try:
         return run(cfg)
-    except Exception as exc:  # noqa: BLE001
-        payload = {
-            "successful": False,
-            "message": "Dataset validator crashed.",
-            "error": {
-                "type": type(exc).__name__,
-                "message": str(exc),
-                "traceback": traceback.format_exc(),
-            },
-            "metadata": {"template": TEMPLATE_NAME, "datasetDir": str(cfg.dataset_dir)},
-        }
-        try:
-            write_result(cfg, payload)
-            notify_done_callback(cfg)
-        except Exception as write_exc:  # noqa: BLE001
-            log(f"Failed to persist crash result: {write_exc}")
+    except Exception as exc:  # noqa: BLE001 - config-parse or run() crash
+        log(f"Validation failed ({type(exc).__name__}): {exc}")
+        _persist_failure(cfg, exc)
         return 1
+    finally:
+        try:
+            result = notify_done_callback(cfg) if cfg is not None else _notify_from_env()
+            log(f"Callback: {json.dumps(result, sort_keys=True)}")
+        except Exception as cb_exc:  # noqa: BLE001 - the callback must never mask the real exit
+            log(f"Done callback failed: {cb_exc}")
 
 
 if __name__ == "__main__":

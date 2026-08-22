@@ -180,3 +180,41 @@ def test_directory_mode_byte_cap(tmp_path, monkeypatch):
 def test_safe_parse_bad_env(monkeypatch):
     monkeypatch.setenv("DIMER_MAX_COMPRESSION_RATIO", "not-a-number")
     assert V._safe_float(os.environ.get("DIMER_MAX_COMPRESSION_RATIO"), 200.0) == 200.0
+
+
+class _FakePost:
+    """Records callback POST URLs and returns a minimal ok response (stands in for requests.post)."""
+
+    def __init__(self):
+        self.urls: list[str] = []
+
+    def __call__(self, url, timeout=None):
+        self.urls.append(url)
+        return type("_Resp", (), {"ok": True, "status_code": 200})()
+
+
+def test_config_error_still_notifies_callback(tmp_path, monkeypatch):
+    """A config-parse failure must still POST the done callback, or the UI hangs at 'Validating...'."""
+    fake = _FakePost()
+    monkeypatch.setattr(V.requests, "post", fake)
+    monkeypatch.setenv("DIMER_RESULT_PATH", str(tmp_path / "result.json"))
+    monkeypatch.setenv("DIMER_DONE_CALLBACK", "http://backend/done")
+    monkeypatch.setenv("DIMER_PREPROCESSING_ARGS_JSON", "{not valid json")
+    assert V.main() == 1
+    assert fake.urls == ["http://backend/done"]
+
+
+def test_write_failure_still_notifies_callback(tmp_path, monkeypatch):
+    """If result-writing raises, the done callback must still fire — it is decoupled from the write."""
+    fake = _FakePost()
+    monkeypatch.setattr(V.requests, "post", fake)
+
+    def _boom(cfg, payload):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(V, "write_result", _boom)
+    monkeypatch.setenv("DIMER_DATASET_DIR", str(tmp_path))     # empty dir -> normal run, no train.csv
+    monkeypatch.setenv("DIMER_RESULT_PATH", str(tmp_path / "result.json"))
+    monkeypatch.setenv("DIMER_DONE_CALLBACK", "http://backend/done")
+    assert V.main() == 1
+    assert fake.urls == ["http://backend/done"]
