@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """DIMER portal entrypoint for the Mitra tabular-classification validator.
 
-The DIMER Pipeline Builder builds this repository from its root and launches the
-validation container by the portal naming convention (``validate.py``). The
-tested implementation lives in ``validator.py``; this thin shim only delegates to
-it so that ``validator.py``, its unit tests, and the cross-repo shared block stay
-byte-identical. Keep this file free of logic.
+The tested task implementation remains in ``validator.py``. The repo-owned contract hardening
+layer is installed here before delegation so DIMER sees the versioned/coded result envelope,
+canonical task identity, and validator/finetuner-shared dataset identity without duplicating ML
+validation semantics.
 """
 from __future__ import annotations
 
 import sys
 
-from validator import main
+import contract_hardening
+import validator
+
+contract_hardening.install_validator(validator, "tabular_classification")
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(validator.main())

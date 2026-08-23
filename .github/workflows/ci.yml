@@ -14,8 +14,10 @@ jobs:
           python-version: "3.12"
       - run: pip install pandas numpy requests pytest
       - name: Compile
-        run: python -m py_compile validator.py
+        run: python -m py_compile validator.py validate.py contract_hardening.py
       - name: Shared block (cross-repo parity)
         run: python scripts/check_shared.py
+      - name: DIMER contract
+        run: python scripts/check_contract.py
       - name: Unit tests
         run: python -m pytest tests/ -q
