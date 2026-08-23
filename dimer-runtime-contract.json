@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "scope": "mitra-classifier-and-regressor",
+  "sharedCodeStrategy": "KEEP_PARITY_COPIES",
+  "taskTypes": [
+    "tabular_classification",
+    "tabular_regression"
+  ],
+  "resultContract": {
+    "schemaVersion": 1,
+    "stableCodes": [
+      "VALID",
+      "INVALID_DATASET",
+      "VALIDATION_FAILED",
+      "SUCCEEDED",
+      "INVALID_CONFIGURATION",
+      "RESOURCE_LIMIT",
+      "TRAINING_FAILED",
+      "ARTIFACT_FAILED"
+    ],
+    "messageSemantics": "human-readable-only",
+    "secondaryJson": {
+      "evaluation/report.json": "stable-v1",
+      "logs/run-summary.json": "stable-v1",
+      "progress/epoch_*.json": "stable-v1"
+    }
+  },
+  "runtimeInputs": [
+    {"name": "DIMER_DATASET_DIR", "consumers": ["validator", "finetuner"], "requirement": "defaulted", "evidence": "documented", "default": "/data/dataset"},
+    {"name": "DIMER_OUTPUT_DIR", "consumers": ["finetuner"], "requirement": "defaulted", "evidence": "documented", "default": "/data/output"},
+    {"name": "DIMER_RESULT_PATH", "consumers": ["validator", "finetuner"], "requirement": "defaulted", "evidence": "documented"},
+    {"name": "DIMER_PREPROCESSING_ARGS_JSON", "consumers": ["validator", "finetuner"], "requirement": "defaulted", "evidence": "documented", "default": "{}"},
+    {"name": "DIMER_HYPERPARAMETERS_JSON", "consumers": ["finetuner"], "requirement": "defaulted", "evidence": "documented", "default": "{}"},
+    {"name": "DIMER_MODEL_CONFIG_JSON", "consumers": ["finetuner"], "requirement": "defaulted", "evidence": "observed", "default": "{}"},
+    {"name": "DIMER_DONE_CALLBACK", "consumers": ["validator", "finetuner"], "requirement": "optional", "evidence": "documented"},
+    {"name": "DIMER_TRAIN_DEVICE", "consumers": ["finetuner"], "requirement": "defaulted", "evidence": "documented", "default": "cuda:0"},
+    {"name": "DIMER_EXPECTED_ACCELERATOR", "consumers": ["finetuner"], "requirement": "optional", "evidence": "observed"},
+    {"name": "DIMER_RUN_ID", "consumers": ["finetuner"], "requirement": "optional", "evidence": "observed"},
+    {"name": "DIMER_SESSION_ID", "consumers": ["finetuner"], "requirement": "optional", "evidence": "observed"},
+    {"name": "DIMER_PIPELINE_ID", "consumers": ["validator", "finetuner"], "requirement": "optional", "evidence": "observed"},
+    {"name": "DIMER_PIPELINE_METADATA_JSON", "consumers": ["validator", "finetuner"], "requirement": "defaulted", "evidence": "observed", "default": "{}"},
+    {"name": "DIMER_CALLBACK_TIMEOUT_SECONDS", "consumers": ["validator", "finetuner"], "requirement": "defaulted", "evidence": "repo-supported", "default": "10"},
+    {"name": "DIMER_MAX_UNCOMPRESSED_BYTES", "consumers": ["validator", "finetuner"], "requirement": "defaulted", "evidence": "repo-supported"},
+    {"name": "DIMER_MAX_COMPRESSION_RATIO", "consumers": ["validator", "finetuner"], "requirement": "defaulted", "evidence": "repo-supported"},
+    {"name": "DIMER_MAX_MEMBER_BYTES", "consumers": ["validator", "finetuner"], "requirement": "defaulted", "evidence": "repo-supported"},
+    {"name": "DIMER_MAX_CSV_ROWS", "consumers": ["validator", "finetuner"], "requirement": "defaulted", "evidence": "repo-supported"},
+    {"name": "DIMER_CSV_CHUNK_ROWS", "consumers": ["validator", "finetuner"], "requirement": "defaulted", "evidence": "repo-supported"},
+    {"name": "DIMER_MAX_SAMPLE_FILES", "consumers": ["validator"], "requirement": "defaulted", "evidence": "repo-supported", "default": "25"},
+    {"name": "DIMER_MAX_EVAL_ROWS", "consumers": ["finetuner"], "requirement": "defaulted", "evidence": "repo-supported", "default": "50000"},
+    {"name": "DIMER_MITRA_REVISION", "consumers": ["finetuner"], "requirement": "defaulted", "evidence": "repo-supported", "default": "pinned-revision"},
+    {"name": "DIMER_MODEL_DIR", "consumers": ["finetuner"], "requirement": "unsupported", "evidence": "inferred", "note": "Do not promote to the DIMER contract until the Base Model upload/mount shape is observed and confirmed; tracked separately in finetuner issue #9."}
+  ],
+  "artifactContract": {
+    "logicalModelFormat": "autogluon-tabular-predictor",
+    "packageFormat": "zip",
+    "compatibilityPath": "artifacts/best.pt",
+    "requiredVerification": "unpack-reload-predict",
+    "checksum": "sha256-of-exact-packaged-bytes"
+  }
+}
