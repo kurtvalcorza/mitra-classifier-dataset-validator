@@ -156,7 +156,7 @@ def normalize_payload(
     dataset_dir = Path(cfg.dataset_dir) if cfg is not None else Path(os.getenv("DIMER_DATASET_DIR", "/data/dataset"))
     try:
         identity = dataset_identity(dataset_dir)
-    except Exception:
+    except Exception:  # identity is diagnostic; never mask the original result
         identity = None
     if identity:
         metadata.setdefault("datasetIdentity", identity)
@@ -242,7 +242,7 @@ def verify_packaged_predictor(worker: Any, cfg: Any, package: Path) -> None:
     probe = _probe_frame(worker, cfg)
     try:
         from autogluon.tabular import TabularPredictor
-    except Exception as exc:
+    except Exception as exc:  # pragma: no cover - exercised by real-stack integration
         raise ArtifactContractError(f"AutoGluon unavailable for artifact reload verification: {exc}") from exc
 
     with tempfile.TemporaryDirectory(prefix="dimer-artifact-verify-") as tmp:
@@ -255,7 +255,7 @@ def verify_packaged_predictor(worker: Any, cfg: Any, package: Path) -> None:
         try:
             predictor = TabularPredictor.load(str(predictor_dir))
             predictions = predictor.predict(probe)
-        except Exception as exc:
+        except Exception as exc:  # pragma: no cover - exercised by real-stack integration
             raise ArtifactContractError(f"packaged predictor reload/predict failed: {exc}") from exc
         if len(predictions) != len(probe):
             raise ArtifactContractError(
@@ -337,6 +337,8 @@ def install_finetuner(worker: Any, task_type: str) -> None:
         return
     worker._DIMER_CONTRACT_HARDENING = True
 
+    # Preserve the existing public provenance key while replacing its directory-mode digest
+    # with the same path-framed algorithm used by the validator.
     worker._dataset_sha256 = lambda cfg: dataset_identity(Path(cfg.dataset_dir))
 
     original_package: Callable[..., Any] = worker._package_artifacts
