@@ -140,3 +140,58 @@ def test_unreadable_inner_zip_rejected_clearly(tmp_path):
     _upload(tmp_path, {"inner.zip": b"not a zip at all"})
     with pytest.raises(ValueError, match=r"nested archive 'inner.zip' is not a readable zip"):
         V.DatasetSource(tmp_path)
+
+
+def _flood(n: int) -> bytes:
+    """A zip of n zero-byte entries: invisible to the size and ratio guards."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        for i in range(n):
+            zf.writestr(f"e{i}.txt", b"")
+    return buf.getvalue()
+
+
+def test_entry_flood_in_outer_zip_rejected(tmp_path):
+    (tmp_path / "upload.zip").write_bytes(_flood(V.MAX_ARCHIVE_MEMBERS + 1))
+    with pytest.raises(ValueError, match=r"entries \(> 10,000\).*entry-count guard"):
+        V.DatasetSource(tmp_path)
+
+
+def test_entry_flood_in_inner_zip_rejected(tmp_path):
+    _upload(tmp_path, {"inner.zip": _flood(V.MAX_ARCHIVE_MEMBERS + 1)})
+    with pytest.raises(ValueError, match=r"^nested archive 'inner.zip': .*entry-count guard"):
+        V.DatasetSource(tmp_path)
+
+
+def test_entry_count_at_the_cap_is_accepted(tmp_path):
+    members = {f"e{i}.txt": b"" for i in range(V.MAX_ARCHIVE_MEMBERS - 1)}
+    members["train.csv"] = _csv_bytes(_train())
+    _upload(tmp_path, {"inner.zip": _zip_bytes(members)})
+    src = V.DatasetSource(tmp_path)
+    try:
+        assert src.unwrapped_from == "inner.zip"
+        assert src.resolve_single("train") == "train.csv"
+    finally:
+        src.close()
+
+
+def _set_encrypted_flag(data: bytes) -> bytes:
+    """The stdlib cannot write encrypted zips, so mark the entries encrypted by setting bit 0 of
+    the general-purpose flag in each local header (offset 6) and central directory entry (offset 8)."""
+    out = bytearray(data)
+    for sig, off in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+        pos = out.find(sig)
+        while pos != -1:
+            out[pos + off] |= 0x01
+            pos = out.find(sig, pos + 4)
+    return bytes(out)
+
+
+def test_encrypted_nested_member_rejected_clearly(tmp_path):
+    inner = _zip_bytes({"train.csv": _csv_bytes(_train())})
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        zf.writestr("inner.zip", inner)
+    (tmp_path / "upload.zip").write_bytes(_set_encrypted_flag(buf.getvalue()))
+    with pytest.raises(ValueError, match=r"nested archive 'inner.zip' is not a readable zip: RuntimeError"):
+        V.DatasetSource(tmp_path)

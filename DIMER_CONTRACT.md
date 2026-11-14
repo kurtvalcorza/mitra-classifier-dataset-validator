@@ -33,8 +33,8 @@ Validator output exposes `metadata.datasetIdentity` / `metadata.datasetSha256`; 
 exposes the same identity in provenance. The intended invariant is that the bytes validated are the
 bytes trained.
 
-Nested-ZIP behavior is **not** changed here; it remains tracked separately in the validator #8
-issues and must be propagated with the existing shared-block SHA discipline.
+Nested ZIP: an upload whose only file entry is itself a `.zip` is unwrapped one level and validated from the inner archive, which passes the same zip-bomb (ratio > 200x), per-file (> 1 GiB), total-size and entry-count (> 10,000 entries) guards as the outer one. Any other `.zip` entry (beside other files, two `.zip`s, or a second level of nesting) is still rejected by `no_nested_zip`. This lives in the shared block, so any change to it is propagated with the
+existing shared-block SHA discipline.
 
 ## Result envelope
 

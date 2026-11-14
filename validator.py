@@ -72,6 +72,9 @@ MAX_COMPRESSION_RATIO = _safe_float(os.getenv("DIMER_MAX_COMPRESSION_RATIO"), 20
 MAX_MEMBER_UNCOMPRESSED_BYTES = _safe_int(os.getenv("DIMER_MAX_MEMBER_BYTES"), 1 * 1024**3)
 MAX_CSV_ROWS = _safe_int(os.getenv("DIMER_MAX_CSV_ROWS"), 5_000_000)
 CSV_READ_CHUNK_ROWS = _safe_int(os.getenv("DIMER_CSV_CHUNK_ROWS"), 200_000)
+# Entry-count ceiling per archive (outer and unwrapped inner). Every entry counts, including
+# zero-byte files and directories, which the size and ratio guards cannot see.
+MAX_ARCHIVE_MEMBERS = _safe_int(os.getenv("DIMER_MAX_ARCHIVE_MEMBERS"), 10_000)
 _DATASET_DIR_ALIASES = {"dataset", "datasets"}
 
 
@@ -90,9 +93,15 @@ def _normalize_member(name: str) -> str | None:
 
 
 def _assert_zip_safe(zf: zipfile.ZipFile) -> None:
-    """Reject pathological archives (zip bombs, oversized expansion) before any read."""
+    """Reject pathological archives (zip bombs, oversized expansion, entry floods) before any read."""
+    entries = zf.infolist()
+    if len(entries) > MAX_ARCHIVE_MEMBERS:
+        raise ValueError(
+            f"archive has {len(entries):,} entries (> {MAX_ARCHIVE_MEMBERS:,}); refusing "
+            f"(entry-count guard, DIMER_MAX_ARCHIVE_MEMBERS)"
+        )
     total = 0
-    for info in zf.infolist():
+    for info in entries:
         if info.is_dir():
             continue
         total += info.file_size
@@ -161,6 +170,7 @@ class DatasetSource:
         the no_nested_zip check still rejects it with its fix-it message."""
         import shutil
         import tempfile
+        import zlib
 
         if len(self._members) != 1:
             return
@@ -168,16 +178,26 @@ class DatasetSource:
         if len(raws) != 1 or not normalized.lower().endswith(".zip"):
             return
         raw = raws[0]
-        spool = tempfile.TemporaryFile()
+        try:
+            spool = tempfile.TemporaryFile()
+        except OSError as exc:
+            raise ValueError(
+                f"nested archive {raw!r} is not a readable zip: no writable temp space ({exc})"
+            ) from exc
         try:
             # The outer guard already bounded this member's size and compression ratio.
             with self._zip.open(raw) as member:
                 shutil.copyfileobj(member, spool)
             spool.seek(0)
             inner = zipfile.ZipFile(spool)
-        except zipfile.BadZipFile as exc:
+        except (zipfile.BadZipFile, RuntimeError, NotImplementedError, zlib.error, EOFError,
+                OSError) as exc:
+            # RuntimeError: encrypted member; NotImplementedError: unsupported compression;
+            # zlib.error / EOFError: corrupt or truncated data; OSError: temp space full.
             spool.close()
-            raise ValueError(f"nested archive {raw!r} is not a readable zip: {exc}") from exc
+            raise ValueError(
+                f"nested archive {raw!r} is not a readable zip: {type(exc).__name__}: {exc}"
+            ) from exc
         try:
             _assert_zip_safe(inner)
         except ValueError as exc:
