@@ -72,6 +72,15 @@ MAX_COMPRESSION_RATIO = _safe_float(os.getenv("DIMER_MAX_COMPRESSION_RATIO"), 20
 MAX_MEMBER_UNCOMPRESSED_BYTES = _safe_int(os.getenv("DIMER_MAX_MEMBER_BYTES"), 1 * 1024**3)
 MAX_CSV_ROWS = _safe_int(os.getenv("DIMER_MAX_CSV_ROWS"), 5_000_000)
 CSV_READ_CHUNK_ROWS = _safe_int(os.getenv("DIMER_CSV_CHUNK_ROWS"), 200_000)
+# Entry-count ceiling per archive (outer and unwrapped inner). Every entry counts, including
+# zero-byte files and directories, which the size and ratio guards cannot see. A fixed constant,
+# not a runtime knob. The central-directory byte budget lets the cap be enforced from the
+# end-of-central-directory record alone, BEFORE zipfile parses the directory into memory.
+MAX_ARCHIVE_MEMBERS = 10_000
+# Budget of 256 bytes per entry on average (46-byte header + name + extra), plus slack. zipfile
+# parses entries until the declared size is used up, so this also bounds a directory whose
+# declared entry total understates it: at most ~57k minimal 46-byte entries.
+MAX_CENTRAL_DIRECTORY_BYTES = MAX_ARCHIVE_MEMBERS * 256 + 64 * 1024
 _DATASET_DIR_ALIASES = {"dataset", "datasets"}
 
 
@@ -89,10 +98,53 @@ def _normalize_member(name: str) -> str | None:
     return "/".join(parts)
 
 
+def _entry_flood_error(entries: int | None, cd_bytes: int | None = None) -> ValueError:
+    what = f"{entries:,} entries" if entries is not None else f"a {cd_bytes:,}-byte central directory"
+    limit = (f"> {MAX_ARCHIVE_MEMBERS:,} entries" if entries is not None
+             else f"> {MAX_CENTRAL_DIRECTORY_BYTES:,} bytes")
+    return ValueError(f"archive has {what} ({limit}); refusing (entry-count zip-bomb guard)")
+
+
+# The pre-check uses zipfile's OWN end-of-central-directory reader, so it locates exactly the
+# record (classic or ZIP64) that the running interpreter's zipfile.ZipFile will then parse. These
+# are private zipfile names: fail loudly at import if a Python upgrade removes them, rather than
+# silently skipping the check.
+for _zip_private in ("_EndRecData", "_ECD_ENTRIES_TOTAL", "_ECD_SIZE"):
+    if not hasattr(zipfile, _zip_private):
+        raise ImportError(
+            f"zipfile.{_zip_private} is missing on this Python; the archive entry-count "
+            f"pre-check (_assert_directory_bounded) depends on it"
+        )
+
+
+def _assert_directory_bounded(fp) -> None:
+    """Reject an entry flood from the end-of-central-directory record alone, BEFORE
+    zipfile.ZipFile parses the directory into memory. zipfile parses as many entries as fit in
+    the declared directory size, so the size bound is the one that limits memory; the declared
+    total is checked too. Fails closed when no EOCD is found. Restores the file position."""
+    position = fp.tell()
+    try:
+        endrec = zipfile._EndRecData(fp)
+    finally:
+        fp.seek(position)
+    if endrec is None:
+        raise zipfile.BadZipFile("File is not a zip file")
+    entries = endrec[zipfile._ECD_ENTRIES_TOTAL]
+    cd_bytes = endrec[zipfile._ECD_SIZE]
+    if entries > MAX_ARCHIVE_MEMBERS:
+        raise _entry_flood_error(entries)
+    if cd_bytes > MAX_CENTRAL_DIRECTORY_BYTES:
+        raise _entry_flood_error(None, cd_bytes)
+
+
 def _assert_zip_safe(zf: zipfile.ZipFile) -> None:
-    """Reject pathological archives (zip bombs, oversized expansion) before any read."""
+    """Reject pathological archives (zip bombs, oversized expansion, entry floods) before any read.
+    The exact entry count is re-checked here as a second layer behind _assert_directory_bounded."""
+    entries = zf.infolist()
+    if len(entries) > MAX_ARCHIVE_MEMBERS:
+        raise _entry_flood_error(len(entries))
     total = 0
-    for info in zf.infolist():
+    for info in entries:
         if info.is_dir():
             continue
         total += info.file_size
@@ -128,23 +180,83 @@ class DatasetSource:
         self.archive_name: str | None = None
         self.source_type = "directory"
         self._zip: zipfile.ZipFile | None = None
+        self._spool = None  # temp file backing an unwrapped inner archive
+        self.unwrapped_from: str | None = None  # raw name of the inner .zip, if unwrapped
         self._members: dict[str, list[str]] = {}  # normalized -> [raw member/path, ...]
 
         zips = sorted(dataset_dir.glob("*.zip"))
         if zips:
             self.archive_name = zips[0].name
             self.source_type = "zip"
+            with open(zips[0], "rb") as handle:
+                _assert_directory_bounded(handle)
             self._zip = zipfile.ZipFile(zips[0])
             _assert_zip_safe(self._zip)
-            for raw in self._zip.namelist():
-                nm = _normalize_member(raw)
-                if nm:
-                    self._members.setdefault(nm, []).append(raw)
+            self._index_zip()
+            self._unwrap_single_inner_zip()
         else:
             for p in sorted(dataset_dir.rglob("*")):
                 if p.is_file():
                     key = str(p.relative_to(dataset_dir)).replace("\\", "/")
                     self._members.setdefault(key, []).append(str(p))
+
+    def _index_zip(self) -> None:
+        self._members = {}
+        for raw in self._zip.namelist():
+            nm = _normalize_member(raw)
+            if nm:
+                self._members.setdefault(nm, []).append(raw)
+
+    def _unwrap_single_inner_zip(self) -> None:
+        """Unwrap exactly ONE level of nesting: when the upload's only file member is itself a
+        .zip, read the dataset from that inner archive. The inner archive passes the same
+        zip-bomb / size guards as the outer one. Anything else that contains a .zip (a .zip
+        next to other files, two .zips, or a .zip inside the inner archive) is left as-is, so
+        the no_nested_zip check still rejects it with its fix-it message."""
+        import shutil
+        import tempfile
+        import zlib
+
+        if len(self._members) != 1:
+            return
+        ((normalized, raws),) = self._members.items()
+        if len(raws) != 1 or not normalized.lower().endswith(".zip"):
+            return
+        raw = raws[0]
+        try:
+            spool = tempfile.TemporaryFile()
+        except OSError as exc:
+            raise ValueError(
+                f"nested archive {raw!r} is not a readable zip: no writable temp space ({exc})"
+            ) from exc
+        try:
+            # The outer guard already bounded this member's size and compression ratio.
+            with self._zip.open(raw) as member:
+                shutil.copyfileobj(member, spool)
+            _assert_directory_bounded(spool)  # bound the inner directory before parsing it
+            inner = zipfile.ZipFile(spool)
+        except ValueError as exc:
+            spool.close()
+            raise ValueError(f"nested archive {raw!r}: {exc}") from exc
+        except (zipfile.BadZipFile, RuntimeError, NotImplementedError, zlib.error, EOFError,
+                OSError) as exc:
+            # RuntimeError: encrypted member; NotImplementedError: unsupported compression;
+            # zlib.error / EOFError: corrupt or truncated data; OSError: temp space full.
+            spool.close()
+            raise ValueError(
+                f"nested archive {raw!r} is not a readable zip: {type(exc).__name__}: {exc}"
+            ) from exc
+        try:
+            _assert_zip_safe(inner)
+        except ValueError as exc:
+            inner.close()
+            spool.close()
+            raise ValueError(f"nested archive {raw!r}: {exc}") from exc
+        self._zip.close()
+        self._zip = inner
+        self._spool = spool
+        self.unwrapped_from = raw
+        self._index_zip()
 
     @property
     def files(self) -> list[str]:
@@ -222,6 +334,8 @@ class DatasetSource:
     def close(self) -> None:
         if self._zip is not None:
             self._zip.close()
+        if self._spool is not None:
+            self._spool.close()
 # ============================================================================
 # END shared block
 # ============================================================================
