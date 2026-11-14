@@ -128,6 +128,8 @@ class DatasetSource:
         self.archive_name: str | None = None
         self.source_type = "directory"
         self._zip: zipfile.ZipFile | None = None
+        self._spool = None  # temp file backing an unwrapped inner archive
+        self.unwrapped_from: str | None = None  # raw name of the inner .zip, if unwrapped
         self._members: dict[str, list[str]] = {}  # normalized -> [raw member/path, ...]
 
         zips = sorted(dataset_dir.glob("*.zip"))
@@ -136,15 +138,57 @@ class DatasetSource:
             self.source_type = "zip"
             self._zip = zipfile.ZipFile(zips[0])
             _assert_zip_safe(self._zip)
-            for raw in self._zip.namelist():
-                nm = _normalize_member(raw)
-                if nm:
-                    self._members.setdefault(nm, []).append(raw)
+            self._index_zip()
+            self._unwrap_single_inner_zip()
         else:
             for p in sorted(dataset_dir.rglob("*")):
                 if p.is_file():
                     key = str(p.relative_to(dataset_dir)).replace("\\", "/")
                     self._members.setdefault(key, []).append(str(p))
+
+    def _index_zip(self) -> None:
+        self._members = {}
+        for raw in self._zip.namelist():
+            nm = _normalize_member(raw)
+            if nm:
+                self._members.setdefault(nm, []).append(raw)
+
+    def _unwrap_single_inner_zip(self) -> None:
+        """Unwrap exactly ONE level of nesting: when the upload's only file member is itself a
+        .zip, read the dataset from that inner archive. The inner archive passes the same
+        zip-bomb / size guards as the outer one. Anything else that contains a .zip (a .zip
+        next to other files, two .zips, or a .zip inside the inner archive) is left as-is, so
+        the no_nested_zip check still rejects it with its fix-it message."""
+        import shutil
+        import tempfile
+
+        if len(self._members) != 1:
+            return
+        ((normalized, raws),) = self._members.items()
+        if len(raws) != 1 or not normalized.lower().endswith(".zip"):
+            return
+        raw = raws[0]
+        spool = tempfile.TemporaryFile()
+        try:
+            # The outer guard already bounded this member's size and compression ratio.
+            with self._zip.open(raw) as member:
+                shutil.copyfileobj(member, spool)
+            spool.seek(0)
+            inner = zipfile.ZipFile(spool)
+        except zipfile.BadZipFile as exc:
+            spool.close()
+            raise ValueError(f"nested archive {raw!r} is not a readable zip: {exc}") from exc
+        try:
+            _assert_zip_safe(inner)
+        except ValueError as exc:
+            inner.close()
+            spool.close()
+            raise ValueError(f"nested archive {raw!r}: {exc}") from exc
+        self._zip.close()
+        self._zip = inner
+        self._spool = spool
+        self.unwrapped_from = raw
+        self._index_zip()
 
     @property
     def files(self) -> list[str]:
@@ -222,6 +266,8 @@ class DatasetSource:
     def close(self) -> None:
         if self._zip is not None:
             self._zip.close()
+        if self._spool is not None:
+            self._spool.close()
 # ============================================================================
 # END shared block
 # ============================================================================
