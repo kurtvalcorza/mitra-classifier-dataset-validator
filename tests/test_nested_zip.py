@@ -151,15 +151,29 @@ def _flood(n: int) -> bytes:
     return buf.getvalue()
 
 
+_FLOOD = rf"entries \(> {V.MAX_ARCHIVE_MEMBERS:,} entries\); refusing \(entry-count zip-bomb guard\)"
+
+
 def test_entry_flood_in_outer_zip_rejected(tmp_path):
     (tmp_path / "upload.zip").write_bytes(_flood(V.MAX_ARCHIVE_MEMBERS + 1))
-    with pytest.raises(ValueError, match=r"entries \(> 10,000\).*entry-count guard"):
+    with pytest.raises(ValueError, match=_FLOOD):
         V.DatasetSource(tmp_path)
 
 
 def test_entry_flood_in_inner_zip_rejected(tmp_path):
     _upload(tmp_path, {"inner.zip": _flood(V.MAX_ARCHIVE_MEMBERS + 1)})
-    with pytest.raises(ValueError, match=r"^nested archive 'inner.zip': .*entry-count guard"):
+    with pytest.raises(ValueError, match=r"^nested archive 'inner.zip': .*" + _FLOOD):
+        V.DatasetSource(tmp_path)
+
+
+def test_directory_entries_count_toward_the_cap(tmp_path):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        zf.writestr("train.csv", _csv_bytes(_train()))
+        for i in range(V.MAX_ARCHIVE_MEMBERS):  # one file + MAX directory entries = MAX + 1
+            zf.writestr(f"d{i}/", b"")
+    _upload(tmp_path, {"inner.zip": buf.getvalue()})
+    with pytest.raises(ValueError, match=_FLOOD):
         V.DatasetSource(tmp_path)
 
 
@@ -195,3 +209,107 @@ def test_encrypted_nested_member_rejected_clearly(tmp_path):
     (tmp_path / "upload.zip").write_bytes(_set_encrypted_flag(buf.getvalue()))
     with pytest.raises(ValueError, match=r"nested archive 'inner.zip' is not a readable zip: RuntimeError"):
         V.DatasetSource(tmp_path)
+
+
+# --- the cap is enforced from the end-of-central-directory record, before zipfile parses it ---
+
+def _peak_bytes_constructing(tmp: Path) -> tuple[int, Exception | None]:
+    import tracemalloc
+    tracemalloc.start()
+    err = None
+    try:
+        V.DatasetSource(tmp).close()
+    except ValueError as exc:
+        err = exc
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    return peak, err
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["outer", "inner"])
+def test_20k_entry_flood_rejected_before_directory_parse(tmp_path, nested, monkeypatch):
+    parsed: list[int] = []  # entry counts of every central directory zipfile actually parsed
+    real = zipfile.ZipFile._RealGetContents
+
+    def recording(self):
+        real(self)
+        parsed.append(len(self.filelist))
+
+    monkeypatch.setattr(zipfile.ZipFile, "_RealGetContents", recording)
+    flood = _flood(2 * V.MAX_ARCHIVE_MEMBERS)
+    parsed.clear()  # building the flood parses nothing, but start clean
+    if nested:
+        _upload(tmp_path, {"inner.zip": flood})
+    else:
+        (tmp_path / "upload.zip").write_bytes(flood)
+    peak, err = _peak_bytes_constructing(tmp_path)
+    assert err is not None and "entry-count zip-bomb guard" in str(err)
+    assert f"{2 * V.MAX_ARCHIVE_MEMBERS:,} entries" in str(err)  # from the EOCD record
+    assert peak < 20 * 1024 * 1024, f"peak {peak:,} bytes"
+    assert all(n <= V.MAX_ARCHIVE_MEMBERS for n in parsed), parsed  # flood never parsed
+
+
+def test_oversized_central_directory_rejected_before_parse(tmp_path):
+    # Few entries, but names long enough to blow the central-directory byte budget.
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        for i in range(V.MAX_CENTRAL_DIRECTORY_BYTES // 60_000 + 2):
+            zf.writestr(f"{i:05d}" + "n" * 60_000, b"")
+    (tmp_path / "upload.zip").write_bytes(buf.getvalue())
+    with pytest.raises(ValueError, match=r"central directory .*entry-count zip-bomb guard"):
+        V.DatasetSource(tmp_path)
+
+
+def _zip64(members: dict[str, bytes], monkeypatch) -> bytes:
+    """Force zipfile to write ZIP64 end-of-central-directory records for a small archive."""
+    monkeypatch.setattr(zipfile, "ZIP_FILECOUNT_LIMIT", 1)
+    data = _zip_bytes(members)
+    monkeypatch.undo()
+    assert b"PK\x06\x06" in data and b"PK\x06\x07" in data
+    return data
+
+
+def test_zip64_archive_is_read_and_its_count_used(tmp_path, monkeypatch):
+    data = bytearray(_zip64({"train.csv": _csv_bytes(_train()), "val.csv": _csv_bytes(_train(20))},
+                            monkeypatch))
+    # Put the 0xFFFF sentinel in the classic EOCD: only the ZIP64 record has the true count (2).
+    eocd = data.rfind(b"PK\x05\x06")
+    data[eocd + 8:eocd + 12] = b"\xff\xff\xff\xff"
+    (tmp_path / "upload.zip").write_bytes(bytes(data))
+    src = V.DatasetSource(tmp_path)
+    try:
+        assert src.resolve_single("train") == "train.csv"
+    finally:
+        src.close()
+
+
+def test_zip64_entry_flood_rejected(tmp_path, monkeypatch):
+    members = {f"e{i}.txt": b"" for i in range(V.MAX_ARCHIVE_MEMBERS + 1)}
+    (tmp_path / "upload.zip").write_bytes(_zip64(members, monkeypatch))
+    with pytest.raises(ValueError, match=_FLOOD):
+        V.DatasetSource(tmp_path)
+
+
+# --- end to end through validate.py: the flood maps to the RESOURCE_LIMIT result code ---
+
+@pytest.mark.parametrize("nested", [False, True], ids=["outer", "inner"])
+def test_entry_flood_result_code_is_resource_limit(tmp_path, nested):
+    import json
+    import os
+    import subprocess
+
+    data_dir = tmp_path / "ds"
+    data_dir.mkdir()
+    flood = _flood(V.MAX_ARCHIVE_MEMBERS + 1)
+    if nested:
+        _upload(data_dir, {"inner.zip": flood})
+    else:
+        (data_dir / "upload.zip").write_bytes(flood)
+    result = tmp_path / "result.json"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("DIMER_")}
+    env.update(DIMER_DATASET_DIR=str(data_dir), DIMER_RESULT_PATH=str(result))
+    repo = Path(__file__).resolve().parents[1]
+    subprocess.run([sys.executable, "validate.py"], cwd=repo, env=env, capture_output=True,
+                   text=True, timeout=120)
+    payload = json.loads(result.read_text(encoding="utf-8"))
+    assert payload["code"] == "RESOURCE_LIMIT", payload

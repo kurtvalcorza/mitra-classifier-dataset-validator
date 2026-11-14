@@ -73,8 +73,11 @@ MAX_MEMBER_UNCOMPRESSED_BYTES = _safe_int(os.getenv("DIMER_MAX_MEMBER_BYTES"), 1
 MAX_CSV_ROWS = _safe_int(os.getenv("DIMER_MAX_CSV_ROWS"), 5_000_000)
 CSV_READ_CHUNK_ROWS = _safe_int(os.getenv("DIMER_CSV_CHUNK_ROWS"), 200_000)
 # Entry-count ceiling per archive (outer and unwrapped inner). Every entry counts, including
-# zero-byte files and directories, which the size and ratio guards cannot see.
-MAX_ARCHIVE_MEMBERS = _safe_int(os.getenv("DIMER_MAX_ARCHIVE_MEMBERS"), 10_000)
+# zero-byte files and directories, which the size and ratio guards cannot see. A fixed constant,
+# not a runtime knob. The central-directory byte budget lets the cap be enforced from the
+# end-of-central-directory record alone, BEFORE zipfile parses the directory into memory.
+MAX_ARCHIVE_MEMBERS = 10_000
+MAX_CENTRAL_DIRECTORY_BYTES = MAX_ARCHIVE_MEMBERS * 1024 + 64 * 1024
 _DATASET_DIR_ALIASES = {"dataset", "datasets"}
 
 
@@ -92,14 +95,54 @@ def _normalize_member(name: str) -> str | None:
     return "/".join(parts)
 
 
+def _entry_flood_error(entries: int | None, cd_bytes: int | None = None) -> ValueError:
+    what = f"{entries:,} entries" if entries is not None else f"a {cd_bytes:,}-byte central directory"
+    limit = (f"> {MAX_ARCHIVE_MEMBERS:,} entries" if entries is not None
+             else f"> {MAX_CENTRAL_DIRECTORY_BYTES:,} bytes")
+    return ValueError(f"archive has {what} ({limit}); refusing (entry-count zip-bomb guard)")
+
+
+def _assert_directory_bounded(fp) -> None:
+    """Read only the end-of-central-directory record (and its ZIP64 form, when present) and
+    reject an entry flood before zipfile.ZipFile parses the whole directory into memory. A file
+    without a readable EOCD is left for zipfile to reject as BadZipFile."""
+    import struct
+
+    fp.seek(0, 2)
+    size = fp.tell()
+    tail_len = min(size, 22 + 0xFFFF)  # fixed EOCD record + the largest possible comment
+    fp.seek(size - tail_len)
+    tail = fp.read(tail_len)
+    pos = tail.rfind(b"PK")
+    if pos < 0 or len(tail) - pos < 22:
+        fp.seek(0)
+        return
+    _, _, _, _, entries, cd_bytes, _, _ = struct.unpack("<4s4H2IH", tail[pos:pos + 22])
+    eocd_at = size - tail_len + pos
+    if eocd_at >= 20:
+        fp.seek(eocd_at - 20)
+        locator = fp.read(20)
+        if locator[:4] == b"PK":
+            _, _, z64_at, _ = struct.unpack("<4sIQI", locator)
+            if z64_at + 56 <= size:
+                fp.seek(z64_at)
+                record = fp.read(56)
+                if record[:4] == b"PK":
+                    _, _, _, _, _, _, _, entries, cd_bytes, _ = struct.unpack("<4sQ2H2I4Q", record)
+    fp.seek(0)
+    # A 0xFFFF / 0xFFFFFFFF sentinel without a readable ZIP64 record is also over the limit.
+    if entries > MAX_ARCHIVE_MEMBERS:
+        raise _entry_flood_error(entries)
+    if cd_bytes > MAX_CENTRAL_DIRECTORY_BYTES:
+        raise _entry_flood_error(None, cd_bytes)
+
+
 def _assert_zip_safe(zf: zipfile.ZipFile) -> None:
-    """Reject pathological archives (zip bombs, oversized expansion, entry floods) before any read."""
+    """Reject pathological archives (zip bombs, oversized expansion, entry floods) before any read.
+    The exact entry count is re-checked here as a second layer behind _assert_directory_bounded."""
     entries = zf.infolist()
     if len(entries) > MAX_ARCHIVE_MEMBERS:
-        raise ValueError(
-            f"archive has {len(entries):,} entries (> {MAX_ARCHIVE_MEMBERS:,}); refusing "
-            f"(entry-count guard, DIMER_MAX_ARCHIVE_MEMBERS)"
-        )
+        raise _entry_flood_error(len(entries))
     total = 0
     for info in entries:
         if info.is_dir():
@@ -145,6 +188,8 @@ class DatasetSource:
         if zips:
             self.archive_name = zips[0].name
             self.source_type = "zip"
+            with open(zips[0], "rb") as handle:
+                _assert_directory_bounded(handle)
             self._zip = zipfile.ZipFile(zips[0])
             _assert_zip_safe(self._zip)
             self._index_zip()
@@ -188,8 +233,11 @@ class DatasetSource:
             # The outer guard already bounded this member's size and compression ratio.
             with self._zip.open(raw) as member:
                 shutil.copyfileobj(member, spool)
-            spool.seek(0)
+            _assert_directory_bounded(spool)  # bound the inner directory before parsing it
             inner = zipfile.ZipFile(spool)
+        except ValueError as exc:
+            spool.close()
+            raise ValueError(f"nested archive {raw!r}: {exc}") from exc
         except (zipfile.BadZipFile, RuntimeError, NotImplementedError, zlib.error, EOFError,
                 OSError) as exc:
             # RuntimeError: encrypted member; NotImplementedError: unsupported compression;
