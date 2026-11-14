@@ -77,7 +77,10 @@ CSV_READ_CHUNK_ROWS = _safe_int(os.getenv("DIMER_CSV_CHUNK_ROWS"), 200_000)
 # not a runtime knob. The central-directory byte budget lets the cap be enforced from the
 # end-of-central-directory record alone, BEFORE zipfile parses the directory into memory.
 MAX_ARCHIVE_MEMBERS = 10_000
-MAX_CENTRAL_DIRECTORY_BYTES = MAX_ARCHIVE_MEMBERS * 1024 + 64 * 1024
+# Budget of 256 bytes per entry on average (46-byte header + name + extra), plus slack. zipfile
+# parses entries until the declared size is used up, so this also bounds a directory whose
+# declared entry total understates it: at most ~57k minimal 46-byte entries.
+MAX_CENTRAL_DIRECTORY_BYTES = MAX_ARCHIVE_MEMBERS * 256 + 64 * 1024
 _DATASET_DIR_ALIASES = {"dataset", "datasets"}
 
 
@@ -102,35 +105,32 @@ def _entry_flood_error(entries: int | None, cd_bytes: int | None = None) -> Valu
     return ValueError(f"archive has {what} ({limit}); refusing (entry-count zip-bomb guard)")
 
 
-def _assert_directory_bounded(fp) -> None:
-    """Read only the end-of-central-directory record (and its ZIP64 form, when present) and
-    reject an entry flood before zipfile.ZipFile parses the whole directory into memory. A file
-    without a readable EOCD is left for zipfile to reject as BadZipFile."""
-    import struct
+# The pre-check uses zipfile's OWN end-of-central-directory reader, so it locates exactly the
+# record (classic or ZIP64) that the running interpreter's zipfile.ZipFile will then parse. These
+# are private zipfile names: fail loudly at import if a Python upgrade removes them, rather than
+# silently skipping the check.
+for _zip_private in ("_EndRecData", "_ECD_ENTRIES_TOTAL", "_ECD_SIZE"):
+    if not hasattr(zipfile, _zip_private):
+        raise ImportError(
+            f"zipfile.{_zip_private} is missing on this Python; the archive entry-count "
+            f"pre-check (_assert_directory_bounded) depends on it"
+        )
 
-    fp.seek(0, 2)
-    size = fp.tell()
-    tail_len = min(size, 22 + 0xFFFF)  # fixed EOCD record + the largest possible comment
-    fp.seek(size - tail_len)
-    tail = fp.read(tail_len)
-    pos = tail.rfind(b"PK")
-    if pos < 0 or len(tail) - pos < 22:
-        fp.seek(0)
-        return
-    _, _, _, _, entries, cd_bytes, _, _ = struct.unpack("<4s4H2IH", tail[pos:pos + 22])
-    eocd_at = size - tail_len + pos
-    if eocd_at >= 20:
-        fp.seek(eocd_at - 20)
-        locator = fp.read(20)
-        if locator[:4] == b"PK":
-            _, _, z64_at, _ = struct.unpack("<4sIQI", locator)
-            if z64_at + 56 <= size:
-                fp.seek(z64_at)
-                record = fp.read(56)
-                if record[:4] == b"PK":
-                    _, _, _, _, _, _, _, entries, cd_bytes, _ = struct.unpack("<4sQ2H2I4Q", record)
-    fp.seek(0)
-    # A 0xFFFF / 0xFFFFFFFF sentinel without a readable ZIP64 record is also over the limit.
+
+def _assert_directory_bounded(fp) -> None:
+    """Reject an entry flood from the end-of-central-directory record alone, BEFORE
+    zipfile.ZipFile parses the directory into memory. zipfile parses as many entries as fit in
+    the declared directory size, so the size bound is the one that limits memory; the declared
+    total is checked too. Fails closed when no EOCD is found. Restores the file position."""
+    position = fp.tell()
+    try:
+        endrec = zipfile._EndRecData(fp)
+    finally:
+        fp.seek(position)
+    if endrec is None:
+        raise zipfile.BadZipFile("File is not a zip file")
+    entries = endrec[zipfile._ECD_ENTRIES_TOTAL]
+    cd_bytes = endrec[zipfile._ECD_SIZE]
     if entries > MAX_ARCHIVE_MEMBERS:
         raise _entry_flood_error(entries)
     if cd_bytes > MAX_CENTRAL_DIRECTORY_BYTES:

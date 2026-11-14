@@ -219,7 +219,7 @@ def _peak_bytes_constructing(tmp: Path) -> tuple[int, Exception | None]:
     err = None
     try:
         V.DatasetSource(tmp).close()
-    except ValueError as exc:
+    except (ValueError, zipfile.BadZipFile) as exc:  # BadZipFile: outer archive zipfile refuses
         err = exc
     _, peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
@@ -313,3 +313,111 @@ def test_entry_flood_result_code_is_resource_limit(tmp_path, nested):
                    text=True, timeout=120)
     payload = json.loads(result.read_text(encoding="utf-8"))
     assert payload["code"] == "RESOURCE_LIMIT", payload
+
+
+# --- the pre-check reads the same EOCD record zipfile will parse (zipfile._EndRecData) ---
+
+def test_zipfile_private_names_used_by_the_precheck_exist():
+    # A Python upgrade that removes these must fail here (and at import), not skip the check.
+    for name in ("_EndRecData", "_ECD_ENTRIES_TOTAL", "_ECD_SIZE"):
+        assert hasattr(zipfile, name), name
+
+
+def _short_name_flood(n: int) -> bytes:
+    """n zero-byte entries with 1-3 character names: the most entries per directory byte."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        for i in range(n):
+            zf.writestr(f"{i:x}", b"")
+    return buf.getvalue()
+
+
+def _eocd(data: bytes) -> int:
+    return data.rfind(b"PK\x05\x06")
+
+
+def _bypass_archives(monkeypatch) -> dict[str, bytes]:
+    """Round-3 review bypass shapes, rebuilt deterministically at 2x the entry cap."""
+    import struct
+
+    n = 2 * V.MAX_ARCHIVE_MEMBERS
+    out: dict[str, bytes] = {}
+    classic = bytearray(_flood(n))
+    e = _eocd(classic)
+    classic[e + 4:e + 8] = b"PK\x05\x06"  # EOCD signature planted in the disk-number fields
+    out["classic_sig_in_disk_fields"] = bytes(classic)
+    monkeypatch.setattr(zipfile, "ZIP_FILECOUNT_LIMIT", 1)  # force ZIP64 records
+    z64 = _flood(n)
+    monkeypatch.undo()
+    e = _eocd(z64)
+    assert z64[e - 20:e - 16] == b"PK\x06\x07" and z64[e - 76:e - 72] == b"PK\x06\x06"
+    far = bytearray(z64)  # locator points nowhere; classic EOCD understates to 1 entry / 46 B
+    far[e + 8:e + 12] = struct.pack("<2H", 1, 1)
+    far[e + 12:e + 16] = struct.pack("<I", 46)
+    far[e - 12:e - 4] = struct.pack("<Q", 2 ** 62)
+    out["zip64_locator_far_away"] = bytes(far)
+    decoy = bytearray(z64)  # locator points at a decoy ZIP64 record hidden in the comment
+    record = struct.pack("<4sQ2H2I4Q", b"PK\x06\x06", 44, 45, 45, 0, 0, 1, 1, 46, 0)
+    decoy[e + 20:e + 22] = struct.pack("<H", len(record))
+    decoy += record
+    decoy[e - 12:e - 4] = struct.pack("<Q", e + 22)
+    out["zip64_decoy_record_in_comment"] = bytes(decoy)
+    return out
+
+
+def _what_zipfile_parses(data: bytes) -> tuple[int, int] | None:
+    try:  # interpreters with the CVE-2025-8291 fix reject a corrupt ZIP64 locator outright
+        rec = zipfile._EndRecData(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        return None
+    return None if rec is None else (rec[zipfile._ECD_ENTRIES_TOTAL], rec[zipfile._ECD_SIZE])
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["outer", "inner"])
+def test_round3_bypass_archives_are_rejected_before_parse(tmp_path, monkeypatch, nested):
+    for name, data in _bypass_archives(monkeypatch).items():
+        try:
+            V._assert_directory_bounded(io.BytesIO(data))
+            prechecked = False
+        except (ValueError, zipfile.BadZipFile):
+            prechecked = True
+        parsed = _what_zipfile_parses(data)
+        # Differential rule: the pre-check rejects, or zipfile would parse a bounded directory.
+        assert prechecked or parsed is None or (parsed[0] <= V.MAX_ARCHIVE_MEMBERS
+                                                and parsed[1] <= V.MAX_CENTRAL_DIRECTORY_BYTES), (name, parsed)
+        case = tmp_path / name
+        case.mkdir()
+        if nested:
+            _upload(case, {"inner.zip": data})
+        else:
+            (case / "upload.zip").write_bytes(data)
+        peak, err = _peak_bytes_constructing(case)
+        assert err is not None, name
+        assert peak < 20 * 1024 * 1024, (name, f"peak {peak:,} bytes")
+
+
+def test_understated_entry_total_is_bounded_by_directory_size(tmp_path):
+    """The declared total can lie low; zipfile then parses entries until the declared directory
+    size is used up. The byte budget bounds that worst case, and the post-open count rejects it."""
+    import struct
+
+    n = V.MAX_CENTRAL_DIRECTORY_BYTES // 50  # ~50-byte entries (46 + hex name): densest that fits
+    data = bytearray(_short_name_flood(n))
+    e = _eocd(data)
+    cd_bytes = struct.unpack("<I", data[e + 12:e + 16])[0]
+    assert cd_bytes <= V.MAX_CENTRAL_DIRECTORY_BYTES
+    data[e + 8:e + 12] = struct.pack("<2H", 1, 1)  # claim 1 entry
+    (tmp_path / "upload.zip").write_bytes(bytes(data))
+    peak, err = _peak_bytes_constructing(tmp_path)
+    assert err is not None and "entry-count zip-bomb guard" in str(err)
+    print(f"understated-total worst case: {n:,} entries parsed, peak {peak / 2**20:.2f} MiB")
+    assert peak < 64 * 1024 * 1024, f"peak {peak:,} bytes for {n:,} parsed entries"
+
+
+def test_archive_without_eocd_fails_closed(tmp_path):
+    with pytest.raises(zipfile.BadZipFile):
+        V._assert_directory_bounded(io.BytesIO(b"PK\x03\x04 not really a zip"))
+    fp = io.BytesIO(_zip_bytes({"train.csv": b"a\n1\n"}))
+    fp.seek(5)
+    V._assert_directory_bounded(fp)
+    assert fp.tell() == 5  # file position restored
