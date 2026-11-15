@@ -24,7 +24,7 @@ END = "# END shared block"
 
 # Cross-repo pin. When the block legitimately changes, re-propagate it to every repo AND update
 # this constant in every repo's scripts/check_shared.py together (they must stay identical).
-EXPECTED_SHARED_BLOCK_SHA256 = "eef5740d696c4d3a34789e3955be87297be17fc85da874780cd4f7d28757e9d0"
+EXPECTED_SHARED_BLOCK_SHA256 = "b1a8db6ae46116d4d33702f25df5d616f403b8152d8da8174c74bee61190931b"
 
 CANDIDATES = [
     Path("validator/validator.py"), Path("finetuner/train.py"),  # umbrella layout

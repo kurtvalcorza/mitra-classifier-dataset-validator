@@ -194,9 +194,10 @@ class DatasetSource:
                 with open(zips[0], "rb") as handle:
                     _assert_directory_bounded(handle)
                 self._zip = zipfile.ZipFile(zips[0])
-            except (OSError, struct.error) as exc:
+            except (OSError, struct.error, NotImplementedError) as exc:
                 # OSError: the upload itself cannot be read (I/O error, permissions);
-                # struct.error: a malformed record zipfile did not turn into BadZipFile.
+                # struct.error: a malformed record zipfile did not turn into BadZipFile;
+                # NotImplementedError: an unsupported zip version (e.g. "zip file version 10.3").
                 raise ValueError(
                     f"archive {self.archive_name!r} is not a readable zip: "
                     f"{type(exc).__name__}: {exc}"

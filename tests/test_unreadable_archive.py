@@ -136,3 +136,24 @@ def test_resource_limit_rejections_are_not_swallowed(tmp_path, monkeypatch):
         V.DatasetSource(tmp_path)
     assert "not a readable zip" not in str(info.value)
     assert _code(info.value) == H.RESOURCE_LIMIT
+
+
+def _declare_unsupported_version(data: bytes) -> bytes:
+    """Set every central-directory entry's version-needed-to-extract to 10.3 (zipfile caps at 6.3)."""
+    out = bytearray(data)
+    pos = out.find(b"PK\x01\x02")
+    assert pos != -1
+    while pos != -1:
+        struct.pack_into("<H", out, pos + 6, 103)
+        pos = out.find(b"PK\x01\x02", pos + 4)
+    return bytes(out)
+
+
+def test_outer_unsupported_zip_version_is_rejected_cleanly(tmp_path):
+    (tmp_path / "upload.zip").write_bytes(
+        _declare_unsupported_version(_zip_bytes({"train.csv": b"f1,target\n1,a\n2,b\n"})))
+    with pytest.raises(ValueError, match=r"archive 'upload.zip' is not a readable zip: "
+                                         r"NotImplementedError: zip file version 10.3") as info:
+        V.DatasetSource(tmp_path)
+    assert isinstance(info.value.__cause__, NotImplementedError)
+    assert _code(info.value) == H.VALIDATOR_RUNTIME_FAILURE
