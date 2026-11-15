@@ -35,7 +35,10 @@ bytes trained.
 
 Nested ZIP: an upload whose only file entry is itself a `.zip` is unwrapped one level and validated
 from the inner archive, which passes the same zip-bomb (ratio > 200x), per-file (> 1 GiB),
-total-size and entry-count (> 10,000 entries) guards as the outer one. Any other `.zip` entry
+total-size and entry-count (> 10,000 entries, or a central directory over
+`MAX_CENTRAL_DIRECTORY_BYTES` = 2,625,536 B, i.e. 256 B per entry + 64 KiB) guards as the outer
+one. An archive of 10,000 or fewer entries is still rejected once its central directory averages
+more than about 262 B per entry, which happens with long file names. Any other `.zip` entry
 (beside other files, two `.zip`s, or a second level of nesting) is still rejected by
 `no_nested_zip`. This lives in the shared block, so any change to it is propagated with the existing
 shared-block SHA discipline.

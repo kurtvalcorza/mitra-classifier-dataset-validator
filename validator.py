@@ -188,9 +188,20 @@ class DatasetSource:
         if zips:
             self.archive_name = zips[0].name
             self.source_type = "zip"
-            with open(zips[0], "rb") as handle:
-                _assert_directory_bounded(handle)
-            self._zip = zipfile.ZipFile(zips[0])
+            import struct
+
+            try:
+                with open(zips[0], "rb") as handle:
+                    _assert_directory_bounded(handle)
+                self._zip = zipfile.ZipFile(zips[0])
+            except (OSError, struct.error, NotImplementedError) as exc:
+                # OSError: the upload itself cannot be read (I/O error, permissions);
+                # struct.error: a malformed record zipfile did not turn into BadZipFile;
+                # NotImplementedError: an unsupported zip version (e.g. "zip file version 10.3").
+                raise ValueError(
+                    f"archive {self.archive_name!r} is not a readable zip: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
             _assert_zip_safe(self._zip)
             self._index_zip()
             self._unwrap_single_inner_zip()
@@ -214,6 +225,7 @@ class DatasetSource:
         next to other files, two .zips, or a .zip inside the inner archive) is left as-is, so
         the no_nested_zip check still rejects it with its fix-it message."""
         import shutil
+        import struct
         import tempfile
         import zlib
 
@@ -239,9 +251,10 @@ class DatasetSource:
             spool.close()
             raise ValueError(f"nested archive {raw!r}: {exc}") from exc
         except (zipfile.BadZipFile, RuntimeError, NotImplementedError, zlib.error, EOFError,
-                OSError) as exc:
+                OSError, struct.error) as exc:
             # RuntimeError: encrypted member; NotImplementedError: unsupported compression;
-            # zlib.error / EOFError: corrupt or truncated data; OSError: temp space full.
+            # zlib.error / EOFError: corrupt or truncated data; OSError: temp space full;
+            # struct.error: a malformed record zipfile did not turn into BadZipFile.
             spool.close()
             raise ValueError(
                 f"nested archive {raw!r} is not a readable zip: {type(exc).__name__}: {exc}"
